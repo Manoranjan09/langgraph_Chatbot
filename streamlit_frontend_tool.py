@@ -1,14 +1,14 @@
 import streamlit as st
-from langgraph_database_backend import (
+from langgraph_tool_backend import (
     chatbot,
     retrieve_all_threads,
     save_thread_title,
     llm,
 )
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import uuid
 
-# **************************** Utility Functions ****************************
+# =========================== Utilities ===========================
 
 def generate_thread_id():
     return str(uuid.uuid4())
@@ -16,7 +16,8 @@ def generate_thread_id():
 
 def generate_chat_title(user_message):
     prompt = f"""
-Generate a short chat title (maximum 4 words) for the following message.
+Generate a very short conversation title (maximum 4 words)
+for the following user message.
 
 Message:
 {user_message}
@@ -26,21 +27,27 @@ Only return the title.
     return llm.invoke(prompt).content.strip()
 
 
-def add_thread(thread_id, title=None):
+def add_thread(thread_id, title="New Chat"):
 
-    for chat in st.session_state["chat_threads"]:
+    # Update existing thread
+    for i, chat in enumerate(st.session_state["chat_threads"]):
 
         if chat["id"] == thread_id:
 
-            if title is not None:
-                chat["title"] = title
+            chat["title"] = title
+
+            # Move it to the top
+            st.session_state["chat_threads"].pop(i)
+            st.session_state["chat_threads"].insert(0, chat)
 
             return
 
-    st.session_state["chat_threads"].append(
+    # New thread -> insert at top
+    st.session_state["chat_threads"].insert(
+        0,
         {
             "id": thread_id,
-            "title": title or "New Chat"
+            "title": title,
         }
     )
 
@@ -52,7 +59,7 @@ def reset_chat():
     st.session_state["thread_id"] = thread_id
     st.session_state["message_history"] = []
 
-    add_thread(thread_id)
+    add_thread(thread_id, "New Chat")
 
 
 def load_conversation(thread_id):
@@ -68,7 +75,7 @@ def load_conversation(thread_id):
     return state.values.get("messages", [])
 
 
-# **************************** Session Setup ****************************
+# ======================= Session Initialization ===================
 
 if "message_history" not in st.session_state:
     st.session_state["message_history"] = []
@@ -77,17 +84,7 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 
 if "chat_threads" not in st.session_state:
-
-    st.session_state["chat_threads"] = []
-
-    # Load old conversations from SQLite
-    for thread in retrieve_all_threads():
-        st.session_state["chat_threads"].append(
-            {
-                "id": thread,
-                "title": "Previous Chat"
-            }
-        )
+    st.session_state["chat_threads"] = retrieve_all_threads()
 
 current_thread_exists = any(
     chat["id"] == st.session_state["thread_id"]
@@ -97,8 +94,7 @@ current_thread_exists = any(
 if not current_thread_exists:
     add_thread(st.session_state["thread_id"], "New Chat")
 
-
-# **************************** Sidebar ****************************
+# ============================ Sidebar ============================
 
 st.sidebar.title("LangGraph Chatbot")
 
@@ -107,7 +103,7 @@ if st.sidebar.button("➕ New Chat"):
 
 st.sidebar.header("My Conversations")
 
-for chat in reversed(st.session_state["chat_threads"]):
+for chat in st.session_state["chat_threads"]:
 
     if st.sidebar.button(
         chat["title"],
@@ -134,8 +130,7 @@ for chat in reversed(st.session_state["chat_threads"]):
 
         st.session_state["message_history"] = temp_messages
 
-
-# **************************** Main UI ****************************
+# ============================ Main UI ============================
 
 for message in st.session_state["message_history"]:
 
@@ -146,19 +141,19 @@ user_input = st.chat_input("Type here...")
 
 if user_input:
 
-    # Generate title only once
+    # Generate title only for first message
     if len(st.session_state["message_history"]) == 0:
 
         title = generate_chat_title(user_input)
 
         save_thread_title(
-               st.session_state["thread_id"],
-               title
+            st.session_state["thread_id"],
+            title,
         )
 
         add_thread(
-               st.session_state["thread_id"],
-               title
+            st.session_state["thread_id"],
+            title,
         )
 
     st.session_state["message_history"].append(
@@ -183,7 +178,9 @@ if user_input:
 
     with st.chat_message("assistant"):
 
-        def stream():
+        status_holder = {"box": None}
+
+        def ai_only_stream():
 
             for message_chunk, metadata in chatbot.stream(
                 {
@@ -195,10 +192,41 @@ if user_input:
                 stream_mode="messages",
             ):
 
+                if isinstance(message_chunk, ToolMessage):
+
+                    tool_name = getattr(
+                        message_chunk,
+                        "name",
+                        "tool",
+                    )
+
+                    if status_holder["box"] is None:
+
+                        status_holder["box"] = st.status(
+                            f"🔧 Using `{tool_name}` ...",
+                            expanded=True,
+                        )
+
+                    else:
+
+                        status_holder["box"].update(
+                            label=f"🔧 Using `{tool_name}` ...",
+                            state="running",
+                            expanded=True,
+                        )
+
                 if isinstance(message_chunk, AIMessage):
                     yield message_chunk.content
 
-        ai_message = st.write_stream(stream())
+        ai_message = st.write_stream(ai_only_stream())
+
+        if status_holder["box"] is not None:
+
+            status_holder["box"].update(
+                label="✅ Tool finished",
+                state="complete",
+                expanded=False,
+            )
 
     st.session_state["message_history"].append(
         {
